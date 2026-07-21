@@ -30,10 +30,11 @@ Configure live Gemini:
 ```env
 GEMINI_API_KEY=your_key_here
 GEMINI_MODEL=gemini-3.5-flash
+GEMINI_FALLBACK_MODEL=gemini-3.1-flash-lite
 AI_DEMO_FALLBACK=false
 ```
 
-With no API key, Flaky remains demoable but labels diagnoses as **Demo investigator**. When a key is configured and Gemini cannot be reached, Flaky shows a retryable error—it does not silently substitute demo output.
+With no API key, Flaky remains demoable but labels diagnoses as **Demo investigator**. Live requests use bounded retries and a live Gemini 3.1 Flash-Lite failover when 3.5 Flash is temporarily overloaded. When every configured live model is unavailable, Flaky shows a retryable error—it does not silently substitute demo output.
 
 ## Judge demo path
 
