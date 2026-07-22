@@ -7,10 +7,11 @@ type GeminiResponse = {
 type DiagnosisPayload = Pick<Diagnosis, "rootCause" | "confidence" | "suggestedFix" | "quarantineRecommended" | "reasoning" | "signals">;
 
 export const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-3.1-flash-lite";
 const demoFallbackEnabled = process.env.AI_DEMO_FALLBACK === "true";
 
 export class AIServiceError extends Error {
-  constructor(message: string, public readonly status = 503) {
+  constructor(message: string, public readonly status = 503, public readonly retryable = false) {
     super(message);
     this.name = "AIServiceError";
   }
@@ -20,39 +21,82 @@ function apiKey() {
   return process.env.GEMINI_API_KEY?.trim() || null;
 }
 
-async function geminiFetch(path: string, init?: RequestInit) {
+async function geminiFetch(path: string, init?: RequestInit, timeoutMs = 20_000) {
   const key = apiKey();
   if (!key) throw new AIServiceError("Gemini is not configured. Add GEMINI_API_KEY or enable explicit demo mode.", 503);
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/${path}`, {
-    ...init,
-    headers: { "Content-Type": "application/json", "x-goog-api-key": key, ...init?.headers },
-    signal: AbortSignal.timeout(20_000),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`https://generativelanguage.googleapis.com/v1beta/${path}`, {
+      ...init,
+      headers: { "Content-Type": "application/json", "x-goog-api-key": key, ...init?.headers },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    throw new AIServiceError("Gemini network request timed out or could not connect.", 503, true);
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
     const detail = body?.error?.message?.slice(0, 220) || `HTTP ${response.status}`;
-    throw new AIServiceError(`Gemini request failed: ${detail}`, response.status >= 500 ? 503 : 502);
+    const retryable = response.status === 429 || response.status >= 500;
+    throw new AIServiceError(`Gemini request failed: ${detail}`, retryable ? 503 : 502, retryable);
   }
   return response;
 }
 
-async function callGemini(prompt: string): Promise<string> {
-  const response = await geminiFetch(`models/${GEMINI_MODEL}:generateContent`, {
-    method: "POST",
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.15, responseMimeType: "application/json" },
-    }),
-  });
-  const data = (await response.json()) as GeminiResponse;
-  const text = data.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("");
-  if (!text) throw new AIServiceError("Gemini returned an empty response.", 502);
-  return text;
+async function callGemini(prompt: string, responseJsonSchema: Record<string, unknown>): Promise<{ text: string; model: string }> {
+  const models = [...new Set([GEMINI_MODEL, GEMINI_FALLBACK_MODEL])];
+  let lastError: unknown;
+  for (const selectedModel of models) {
+    try {
+      const response = await geminiFetch(`models/${selectedModel}:generateContent`, {
+        method: "POST",
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            responseJsonSchema,
+            thinkingConfig: { thinkingLevel: "low" },
+          },
+        }),
+      }, selectedModel === GEMINI_MODEL ? 20_000 : 35_000);
+      const data = (await response.json()) as GeminiResponse;
+      const text = data.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("");
+      if (!text) throw new AIServiceError("Gemini returned an empty response.", 502);
+      return { text, model: selectedModel };
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof AIServiceError) || !error.retryable) throw error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new AIServiceError("All configured Gemini models are temporarily unavailable.", 503, true);
 }
 
 function extractJson(raw: string) {
   return raw.replace(/^```json\s*/i, "").replace(/\s*```$/, "").trim();
 }
+
+const diagnosisSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    rootCause: { type: "string", description: "Concise root-cause classification." },
+    confidence: { type: "number", minimum: 0, maximum: 1 },
+    suggestedFix: { type: "string", description: "A concrete unified diff or code snippet." },
+    quarantineRecommended: { type: "boolean" },
+    reasoning: { type: "string", description: "Evidence-based reasoning without invented facts." },
+    signals: { type: "array", minItems: 2, maxItems: 5, items: { type: "string" } },
+  },
+  required: ["rootCause", "confidence", "suggestedFix", "quarantineRecommended", "reasoning", "signals"],
+};
+
+const quarantineSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    markdown: { type: "string", description: "Complete ready-to-paste GitHub pull request body in Markdown." },
+  },
+  required: ["markdown"],
+};
 
 function fallbackDiagnosis(test: TestCase, runs: Run[]): DiagnosisPayload {
   const failures = runs.filter((run) => run.status === "fail");
@@ -169,18 +213,22 @@ Classify the likely root cause as one of: race condition/timing issue, test-orde
 Return ONLY valid JSON matching:
 {"rootCause":"string","confidence":0.0,"suggestedFix":"unified diff or code snippet","quarantineRecommended":false,"reasoning":"evidence-based paragraph","signals":["specific signal"]}
 
-Rules: same commit with different outcomes is the core flakiness signal. Give a concrete fix. Recommend quarantine only when the cause cannot be safely removed immediately. Do not invent facts.
+Rules: same commit with different outcomes is the core flakiness signal. Give a concrete fix. Recommend a temporary quarantine when the evidence shows an uncontrolled external service and the deterministic replacement is not yet applied; the quarantine must have an exit criterion. Do not recommend quarantine for timing, shared-state, test-order, or resource-collision causes that can be fixed directly. Do not invent facts.
 
 TEST: ${test.name}\nFILE: ${test.filePath}\nSOURCE:\n${test.sourceSnippet}\nRUNS:\n${JSON.stringify(compactRuns, null, 2)}`;
   try {
-    const payload = JSON.parse(extractJson(await callGemini(prompt))) as DiagnosisPayload;
+    const result = await callGemini(prompt, diagnosisSchema);
+    const payload = JSON.parse(extractJson(result.text)) as DiagnosisPayload;
+    if (!payload.rootCause || !payload.reasoning || !payload.suggestedFix || !Array.isArray(payload.signals)) {
+      throw new AIServiceError("Gemini returned an incomplete diagnosis.", 502);
+    }
     return {
       ...payload,
       confidence: Math.max(0, Math.min(1, Number(payload.confidence))),
       id: `diag-${test.id}-${Date.now()}`,
       testCaseId: test.id,
       createdAt: new Date().toISOString(),
-      model: GEMINI_MODEL,
+      model: result.model,
       aiMode: "live",
     };
   } catch (error) {
@@ -220,8 +268,10 @@ export async function generateQuarantineDescription(test: TestCase, runs: Run[],
   if (!apiKey()) return { markdown: fallback, aiMode: "demo", model: "Deterministic demo investigator" };
   const prompt = `Create a concise ready-to-paste GitHub PR body for temporarily quarantining a flaky test. Include why, concrete evidence, proposed remediation, owner, and measurable exit criteria. Return JSON as {"markdown":"..."}. Do not overstate evidence.\n\nTest: ${JSON.stringify(test)}\nDiagnosis: ${JSON.stringify(diagnosis)}\nRun count: ${runs.length}; failures: ${runs.filter((run) => run.status === "fail").length}`;
   try {
-    const result = JSON.parse(extractJson(await callGemini(prompt))) as { markdown: string };
-    return { markdown: result.markdown || fallback, aiMode: "live", model: GEMINI_MODEL };
+    const response = await callGemini(prompt, quarantineSchema);
+    const result = JSON.parse(extractJson(response.text)) as { markdown?: string };
+    if (!result.markdown) throw new AIServiceError("Gemini returned an empty PR description.", 502);
+    return { markdown: result.markdown, aiMode: "live", model: response.model };
   } catch (error) {
     console.error("Gemini quarantine generation failed:", error);
     if (demoFallbackEnabled) return { markdown: fallback, aiMode: "demo", model: "Deterministic demo investigator" };
